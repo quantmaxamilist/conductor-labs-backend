@@ -288,10 +288,166 @@ app.get('/decisions', async (req, res) => {
   res.json(data);
 });
 
+function parseOutcomeYesOdds(outcomePrices) {
+  let arr = outcomePrices;
+  if (typeof outcomePrices === 'string') {
+    try {
+      arr = JSON.parse(outcomePrices);
+    } catch {
+      return null;
+    }
+  }
+  if (!Array.isArray(arr) || arr.length < 1) return null;
+  const p = parseFloat(arr[0]);
+  if (!Number.isFinite(p)) return null;
+  return Math.round(p * 100);
+}
+
+function polymarketAgentPredictions(yesOdds) {
+  let chatgptPrediction;
+  if (yesOdds > 60) chatgptPrediction = 'YES';
+  else if (yesOdds < 40) chatgptPrediction = 'NO';
+  else chatgptPrediction = 'UNCERTAIN';
+
+  let claudePrediction;
+  if (yesOdds > 65) claudePrediction = 'NO';
+  else if (yesOdds < 35) claudePrediction = 'YES';
+  else claudePrediction = 'UNCERTAIN';
+
+  const geminiPrediction = yesOdds > 55 ? 'YES' : 'NO';
+
+  const favouriteYes = yesOdds >= 50;
+  const grokPickFavourite = Math.random() < 0.72;
+  const grokPrediction =
+    grokPickFavourite ? (favouriteYes ? 'YES' : 'NO') : favouriteYes ? 'NO' : 'YES';
+
+  const chatgptConf =
+    chatgptPrediction === 'YES'
+      ? Math.min(92, 58 + Math.floor((yesOdds - 60) * 1.1))
+      : chatgptPrediction === 'NO'
+        ? Math.min(92, 58 + Math.floor((40 - yesOdds) * 1.1))
+        : 48 + Math.min(12, Math.floor(Math.abs(yesOdds - 50) / 3));
+
+  const claudeConf =
+    claudePrediction === 'YES'
+      ? Math.min(92, 58 + Math.floor((35 - yesOdds) * 1.0))
+      : claudePrediction === 'NO'
+        ? Math.min(92, 58 + Math.floor((yesOdds - 65) * 1.0))
+        : 48 + Math.min(12, Math.floor(Math.abs(yesOdds - 50) / 3));
+
+  const geminiConf =
+    geminiPrediction === 'YES'
+      ? Math.min(90, 56 + Math.floor((yesOdds - 55) * 1.2))
+      : Math.min(88, 54 + Math.floor((55 - yesOdds) * 1.0));
+
+  const grokConf = 52 + Math.floor(Math.random() * 24);
+
+  return {
+    chatgpt: {
+      prediction: chatgptPrediction,
+      confidence: Math.max(45, Math.min(95, chatgptConf)),
+      reasoning:
+        chatgptPrediction === 'YES'
+          ? `Following market consensus at ${yesOdds}% YES`
+          : chatgptPrediction === 'NO'
+            ? `Following market consensus — leaning NO at ${yesOdds}% YES`
+            : `Market mixed — ${yesOdds}% YES is between clear YES/NO bands`,
+    },
+    claude: {
+      prediction: claudePrediction,
+      confidence: Math.max(45, Math.min(95, claudeConf)),
+      reasoning:
+        claudePrediction === 'NO'
+          ? `Fading crowd consensus — contrarian signal at ${yesOdds}% YES`
+          : claudePrediction === 'YES'
+            ? `Contrarian lean YES while the crowd sits at ${yesOdds}% YES`
+            : `No strong contrarian edge at ${yesOdds}% YES`,
+    },
+    gemini: {
+      prediction: geminiPrediction,
+      confidence: Math.max(45, Math.min(95, geminiConf)),
+      reasoning:
+        geminiPrediction === 'YES'
+          ? `Momentum signal suggests YES at ${yesOdds}% implied`
+          : `Momentum signal suggests NO at ${yesOdds}% implied`,
+    },
+    grok: {
+      prediction: grokPrediction,
+      confidence: Math.max(45, Math.min(95, grokConf)),
+      reasoning: `Instinct play — going with ${grokPrediction}`,
+    },
+  };
+}
+
+const POLYMARKET_AGENT_IDS = ['chatgpt', 'claude', 'gemini', 'grok'];
+
+function emptyPolymarketAgentStats() {
+  return Object.fromEntries(
+    POLYMARKET_AGENT_IDS.map((id) => [
+      id,
+      { totalPredictions: 0, correctPredictions: 0, winRate: 0 },
+    ]),
+  );
+}
+
+async function fetchPolymarketAgentStatsFromSupabase() {
+  const empty = emptyPolymarketAgentStats();
+  const { data, error } = await supabase.from('polymarket_predictions').select('*');
+  if (error || !Array.isArray(data)) return empty;
+
+  const stats = emptyPolymarketAgentStats();
+  for (const row of data) {
+    const agent =
+      row.agent_id ||
+      row.agentId ||
+      row.agent ||
+      row.model ||
+      null;
+    if (!agent || !stats[agent]) continue;
+
+    const totalAgg = row.total_predictions ?? row.totalPredictions;
+    const correctAgg = row.correct_predictions ?? row.correctPredictions;
+    if (Number.isFinite(totalAgg)) {
+      stats[agent].totalPredictions += totalAgg;
+      if (Number.isFinite(correctAgg)) stats[agent].correctPredictions += correctAgg;
+      continue;
+    }
+
+    stats[agent].totalPredictions += 1;
+    const won =
+      row.was_correct === true ||
+      row.correct === true ||
+      row.won === true ||
+      row.is_correct === true;
+    if (won) stats[agent].correctPredictions += 1;
+  }
+  for (const id of POLYMARKET_AGENT_IDS) {
+    const s = stats[id];
+    s.winRate = s.totalPredictions > 0 ? s.correctPredictions / s.totalPredictions : 0;
+  }
+  return stats;
+}
+
 app.get('/polymarket', async (req, res) => {
   try {
-    const markets = await fetchPolymarketMarkets();
-    res.json(markets);
+    const rawMarkets = await fetchPolymarketMarkets();
+    const agentStats = await fetchPolymarketAgentStatsFromSupabase();
+    const markets = rawMarkets.map((m) => {
+      const yesOdds = parseOutcomeYesOdds(m.outcomePrices) ?? 0;
+      return {
+        id: String(m.id),
+        question: m.question,
+        yesOdds,
+        endsAt: m.endsAt,
+        predictions: polymarketAgentPredictions(yesOdds),
+      };
+    });
+    res.json({
+      markets,
+      agentStats,
+      recentResolutions: [],
+      updatedAt: new Date().toISOString(),
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
