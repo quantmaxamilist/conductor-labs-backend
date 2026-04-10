@@ -1,4 +1,8 @@
 require('dotenv').config();
+const fetch =
+  typeof globalThis.fetch === 'function'
+    ? globalThis.fetch.bind(globalThis)
+    : require('node-fetch');
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
@@ -24,18 +28,90 @@ let agentStats = {
 };
 let recentDecisions = [];
 
+function recordLatestPrice(price, source) {
+  if (!Number.isFinite(price)) return false;
+  latestPrice = price;
+  priceHistory.push({ price, time: Date.now() });
+  if (priceHistory.length > 30) priceHistory.shift();
+  console.log(`[Conductor Labs] BTC price: $${price.toFixed(2)} (source: ${source})`);
+  return true;
+}
+
 async function fetchBTCPrice() {
+  const binanceUrl = 'https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT';
+
   try {
-    const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT');
-    const data = await res.json();
+    const res = await fetch(binanceUrl);
+    const rawText = await res.text();
+    let data;
+    try {
+      data = JSON.parse(rawText);
+    } catch {
+      console.error(
+        '[Conductor Labs] Binance: response is not valid JSON. status=%s body=%s',
+        res.status,
+        rawText.length > 2000 ? `${rawText.slice(0, 2000)}…` : rawText,
+      );
+      throw new Error('Binance JSON parse failed');
+    }
+
+    if (!res.ok) {
+      console.error(
+        '[Conductor Labs] Binance: HTTP error. status=%s body=%s',
+        res.status,
+        JSON.stringify(data),
+      );
+      throw new Error(`Binance HTTP ${res.status}`);
+    }
+
     const price = parseFloat(data.price);
-    latestPrice = price;
-    priceHistory.push({ price, time: Date.now() });
-    if (priceHistory.length > 30) priceHistory.shift();
-    console.log(`[Conductor Labs] BTC price: $${price.toFixed(2)}`);
+    if (!Number.isFinite(price)) {
+      console.error('[Conductor Labs] Binance: price parse failed (NaN). Full response:', JSON.stringify(data));
+      throw new Error('Binance invalid price');
+    }
+
+    recordLatestPrice(price, 'binance');
     return price;
   } catch (err) {
-    console.error('[Conductor Labs] Price fetch failed:', err.message);
+    console.error('[Conductor Labs] Binance failed:', err.message);
+  }
+
+  const coinbaseUrl = 'https://api.coinbase.com/v2/prices/BTC-USD/spot';
+  try {
+    const res = await fetch(coinbaseUrl);
+    const rawText = await res.text();
+    let data;
+    try {
+      data = JSON.parse(rawText);
+    } catch {
+      console.error(
+        '[Conductor Labs] Coinbase: response is not valid JSON. status=%s body=%s',
+        res.status,
+        rawText.length > 2000 ? `${rawText.slice(0, 2000)}…` : rawText,
+      );
+      return null;
+    }
+
+    if (!res.ok) {
+      console.error(
+        '[Conductor Labs] Coinbase: HTTP error. status=%s body=%s',
+        res.status,
+        JSON.stringify(data),
+      );
+      return null;
+    }
+
+    const amount = data.data && data.data.amount;
+    const price = parseFloat(amount);
+    if (!Number.isFinite(price)) {
+      console.error('[Conductor Labs] Coinbase: price parse failed (NaN). Full response:', JSON.stringify(data));
+      return null;
+    }
+
+    recordLatestPrice(price, 'coinbase');
+    return price;
+  } catch (err) {
+    console.error('[Conductor Labs] Coinbase failed:', err.message);
     return null;
   }
 }
