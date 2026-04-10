@@ -21,6 +21,56 @@ const EVAL_DELAY_MS = 10 * 60 * 1000;
 const POLYMARKET_MARKETS_URL =
   'https://gamma-api.polymarket.com/markets?active=true&limit=20&order=volume&ascending=false';
 
+const POLYMARKET_SPORTS_KEYWORDS = [
+  'vs',
+  ' v ',
+  'win',
+  'wins',
+  'goal',
+  'goals',
+  'match',
+  'game',
+  'league',
+  'cup',
+  'nfl',
+  'nba',
+  'nhl',
+  'mlb',
+  'premier',
+  'champions',
+  'la liga',
+  'serie a',
+  'bundesliga',
+  'playoff',
+  'final',
+  'semifinal',
+  'tournament',
+  'over/under',
+  'o/u',
+  'spread',
+  'moneyline',
+];
+
+function getPolymarketYesProbability(outcomePrices) {
+  let arr = outcomePrices;
+  if (typeof outcomePrices === 'string') {
+    try {
+      arr = JSON.parse(outcomePrices);
+    } catch {
+      return null;
+    }
+  }
+  if (!Array.isArray(arr) || arr.length < 1) return null;
+  const p = parseFloat(arr[0]);
+  return Number.isFinite(p) ? p : null;
+}
+
+function isPolymarketSportsQuestion(question) {
+  if (typeof question !== 'string') return false;
+  const lower = question.toLowerCase();
+  return POLYMARKET_SPORTS_KEYWORDS.some((kw) => lower.includes(kw));
+}
+
 async function fetchPolymarketMarkets() {
   const res = await fetch(POLYMARKET_MARKETS_URL);
   if (!res.ok) throw new Error(`Polymarket HTTP ${res.status}`);
@@ -38,9 +88,19 @@ async function fetchPolymarketMarkets() {
     })
     .filter((x) => x && x.endMs > now);
 
+  const hasMeaningfulOdds = (m) => {
+    const p = getPolymarketYesProbability(m.outcomePrices);
+    return p !== null && p >= 0.05 && p <= 0.95;
+  };
+
+  const meaningful = parsed.filter((x) => hasMeaningfulOdds(x.m));
+  const sportsMeaningful = meaningful.filter((x) => isPolymarketSportsQuestion(x.m.question));
+  const basePool =
+    sportsMeaningful.length < 3 ? meaningful : sportsMeaningful;
+
   for (const hours of windowsHours) {
     const horizon = now + hours * hourMs;
-    const inWindow = parsed.filter((x) => x.endMs <= horizon);
+    const inWindow = basePool.filter((x) => x.endMs <= horizon);
     if (inWindow.length >= 5 || hours === 7 * 24) {
       return inWindow
         .sort((a, b) => a.endMs - b.endMs)
@@ -289,18 +349,8 @@ app.get('/decisions', async (req, res) => {
 });
 
 function parseOutcomeYesOdds(outcomePrices) {
-  let arr = outcomePrices;
-  if (typeof outcomePrices === 'string') {
-    try {
-      arr = JSON.parse(outcomePrices);
-    } catch {
-      return null;
-    }
-  }
-  if (!Array.isArray(arr) || arr.length < 1) return null;
-  const p = parseFloat(arr[0]);
-  if (!Number.isFinite(p)) return null;
-  return Math.round(p * 100);
+  const p = getPolymarketYesProbability(outcomePrices);
+  return p === null ? null : Math.round(p * 100);
 }
 
 function polymarketAgentPredictions(yesOdds) {
