@@ -18,6 +18,42 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const DECISION_INTERVAL_MS = 60 * 1000;
 const EVAL_DELAY_MS = 10 * 60 * 1000;
 
+const POLYMARKET_MARKETS_URL =
+  'https://gamma-api.polymarket.com/markets?active=true&limit=20&order=volume&ascending=false';
+
+async function fetchPolymarketMarkets() {
+  const res = await fetch(POLYMARKET_MARKETS_URL);
+  if (!res.ok) throw new Error(`Polymarket HTTP ${res.status}`);
+  const markets = await res.json();
+  if (!Array.isArray(markets)) return [];
+
+  const now = Date.now();
+  const hourMs = 60 * 60 * 1000;
+  const windowsHours = [24, 48, 7 * 24];
+
+  const parsed = markets
+    .map((m) => {
+      const endMs = m.endDate ? Date.parse(m.endDate) : NaN;
+      return Number.isFinite(endMs) ? { m, endMs } : null;
+    })
+    .filter((x) => x && x.endMs > now);
+
+  for (const hours of windowsHours) {
+    const horizon = now + hours * hourMs;
+    const inWindow = parsed.filter((x) => x.endMs <= horizon);
+    if (inWindow.length >= 5 || hours === 7 * 24) {
+      return inWindow
+        .sort((a, b) => a.endMs - b.endMs)
+        .slice(0, 5)
+        .map(({ m, endMs }) => ({
+          ...m,
+          endsAt: new Date(endMs).toISOString(),
+        }));
+    }
+  }
+  return [];
+}
+
 let latestPrice = null;
 let priceHistory = [];
 let agentStats = {
@@ -250,6 +286,15 @@ app.get('/decisions', async (req, res) => {
     .limit(50);
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
+});
+
+app.get('/polymarket', async (req, res) => {
+  try {
+    const markets = await fetchPolymarketMarkets();
+    res.json(markets);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 const PORT = process.env.PORT || 3001;
